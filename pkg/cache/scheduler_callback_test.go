@@ -31,6 +31,7 @@ import (
 	"gotest.tools/v3/assert"
 	v1 "k8s.io/api/core/v1"
 	apis "k8s.io/apimachinery/pkg/apis/meta/v1"
+	k8sCache "k8s.io/client-go/tools/cache"
 	k8sEvents "k8s.io/client-go/tools/events"
 	fwk "k8s.io/kube-scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
@@ -314,11 +315,13 @@ func TestUpdateAllocation_AllocationReleased_DeleteFailureRedrive(t *testing.T) 
 	task.allocationKey = taskUID1
 
 	var releaseConfirmations atomic.Int32
+	releasesObserved := make(chan *si.AllocationRelease, 2)
 	context.apiProvider.(*client.MockedAPIProvider).MockSchedulerAPIUpdateAllocationFn(func(request *si.AllocationRequest) error {
 		if request.Releases != nil {
 			for _, release := range request.Releases.AllocationsToRelease {
 				if release.ApplicationID == appID && release.AllocationKey == taskUID1 {
 					releaseConfirmations.Add(1)
+					releasesObserved <- release
 				}
 			}
 		}
@@ -404,9 +407,45 @@ func TestUpdateAllocation_AllocationReleased_DeleteFailureRedrive(t *testing.T) 
 	case <-time.After(time.Second):
 		t.Fatal("automatic DELETE re-drive did not finish")
 	}
+	// Acquiring the mock client's lock establishes that KubeClientMock.Delete
+	// has returned after retryFinished was closed by the injected function.
+	context.apiProvider.GetAPIs().KubeClient.GetClientSet()
+	assert.Equal(t, int32(0), releaseConfirmations.Load(),
+		"accepted Kubernetes DELETE must not complete the YuniKorn release")
 	assert.Assert(t, deleteAttempts.Load() >= 2,
 		"expected release obligation to be re-driven after transient delete failure; delete attempts: got %d, want >= 2",
 		deleteAttempts.Load())
+
+	deletedPod := task.GetTaskPod().DeepCopy()
+	context.DeletePod(deletedPod)
+	err = utils.WaitForCondition(func() bool {
+		return task.GetTaskState() == TaskStates().Completed && releaseConfirmations.Load() >= 1
+	}, 10*time.Millisecond, time.Second)
+	assert.NilError(t, err, "original pod deletion did not complete the task and confirm the release")
+	assert.Equal(t, TaskStates().Completed, task.GetTaskState(), "unexpected task state after pod deletion")
+	assert.Equal(t, int32(1), releaseConfirmations.Load(), "original pod deletion must confirm the release exactly once")
+	confirmedRelease := <-releasesObserved
+	assert.Equal(t, appID, confirmedRelease.ApplicationID, "unexpected confirmed application")
+	assert.Equal(t, taskUID1, confirmedRelease.AllocationKey, "unexpected confirmed allocation")
+	assert.Equal(t, si.TerminationType_PREEMPTED_BY_SCHEDULER, confirmedRelease.TerminationType,
+		"release confirmation lost the core termination type")
+
+	// Exercise the tombstone form accepted by the informer-facing DeletePod
+	// callback. Current Task FSM semantics run the CompleteTask before-hook for
+	// a Completed-to-Completed event, producing a duplicate core confirmation.
+	context.DeletePod(k8sCache.DeletedFinalStateUnknown{Key: deletedPod.Name, Obj: deletedPod})
+	err = utils.WaitForCondition(func() bool {
+		return releaseConfirmations.Load() >= 2
+	}, 10*time.Millisecond, time.Second)
+	assert.NilError(t, err, "late deletion tombstone was not processed")
+	assert.Equal(t, TaskStates().Completed, task.GetTaskState(), "late tombstone changed the terminal task state")
+	assert.Equal(t, int32(2), releaseConfirmations.Load(),
+		"current lifecycle behavior should expose the duplicate release confirmation")
+	duplicateRelease := <-releasesObserved
+	assert.Equal(t, appID, duplicateRelease.ApplicationID, "unexpected duplicate-confirmation application")
+	assert.Equal(t, taskUID1, duplicateRelease.AllocationKey, "unexpected duplicate-confirmation allocation")
+	assert.Equal(t, si.TerminationType_PREEMPTED_BY_SCHEDULER, duplicateRelease.TerminationType,
+		"duplicate confirmation lost the core termination type")
 }
 
 func TestUpdateAllocation_AllocationReleased_StoppedByRM(t *testing.T) {
