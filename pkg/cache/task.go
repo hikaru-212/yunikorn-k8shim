@@ -50,6 +50,16 @@ var retryBackoff = wait.Backoff{
 	Cap:      30 * time.Second,
 }
 
+// deleteTaskPodRetryBackoff controls the bounded asynchronous retry used after
+// a core-driven pod delete request fails. The first retry is delayed by
+// Duration so the application event handler can return before the re-drive.
+var deleteTaskPodRetryBackoff = wait.Backoff{
+	Steps:    5,
+	Duration: 100 * time.Millisecond,
+	Factor:   2,
+	Cap:      time.Second,
+}
+
 type Task struct {
 	taskID        string
 	alias         string
@@ -192,7 +202,49 @@ func (task *Task) GetNodeName() string {
 }
 
 func (task *Task) DeleteTaskPod() error {
-	return task.context.apiProvider.GetAPIs().KubeClient.Delete(task.GetTaskPod())
+	pod := task.GetTaskPod().DeepCopy()
+	err := task.context.apiProvider.GetAPIs().KubeClient.Delete(pod)
+	if err != nil {
+		task.retryDeleteTaskPod(pod)
+	}
+	return err
+}
+
+func (task *Task) retryDeleteTaskPod(pod *v1.Pod) {
+	// Keep the retry bound to the pod identity that the core release selected,
+	// even if the task's cached pod changes while this worker is running.
+	pod = pod.DeepCopy()
+	go func() {
+		timer := time.NewTimer(deleteTaskPodRetryBackoff.Duration)
+		defer timer.Stop()
+		<-timer.C
+
+		err := retry.OnError(deleteTaskPodRetryBackoff, func(error) bool {
+			return true
+		}, func() error {
+			err := task.context.apiProvider.GetAPIs().KubeClient.Delete(pod)
+			if err != nil {
+				log.Log(log.ShimCacheTask).Warn("failed to re-drive task pod deletion",
+					zap.String("namespace", pod.Namespace),
+					zap.String("podName", pod.Name),
+					zap.String("podUID", string(pod.UID)),
+					zap.Error(err))
+			}
+			return err
+		})
+		if err != nil {
+			log.Log(log.ShimCacheTask).Error("task pod deletion retry exhausted",
+				zap.String("namespace", pod.Namespace),
+				zap.String("podName", pod.Name),
+				zap.String("podUID", string(pod.UID)),
+				zap.Error(err))
+			return
+		}
+		log.Log(log.ShimCacheTask).Info("task pod deletion accepted on re-drive",
+			zap.String("namespace", pod.Namespace),
+			zap.String("podName", pod.Name),
+			zap.String("podUID", string(pod.UID)))
+	}()
 }
 
 func (task *Task) UpdateTaskPodStatus(pod *v1.Pod) (*v1.Pod, error) {

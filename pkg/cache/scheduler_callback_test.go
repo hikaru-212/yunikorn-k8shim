@@ -21,7 +21,9 @@ package cache
 import (
 	ctx "context"
 	"encoding/json"
+	"errors"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -296,6 +298,115 @@ func TestUpdateAllocation_AllocationReleased(t *testing.T) {
 	assert.Assert(t, !context.schedulerCache.IsAssumedPod(taskUID1))
 	err = utils.WaitForCondition(deleteCalled.Load, 10*time.Millisecond, time.Second)
 	assert.NilError(t, err, "pod has not been deleted")
+}
+
+func TestUpdateAllocation_AllocationReleased_DeleteFailureRedrive(t *testing.T) {
+	callback, context := initCallbackTest(t, false, false)
+	defer dispatcher.UnregisterAllEventHandlers()
+	defer dispatcher.Stop()
+
+	err := context.AssumePod(taskUID1, fakeNodeName)
+	assert.NilError(t, err, "could not assume pod")
+	app := context.getApplication(appID)
+	assert.Assert(t, app != nil)
+	app.sm.SetState(ApplicationStates().Running)
+	task := context.getTask(appID, taskUID1)
+	task.allocationKey = taskUID1
+
+	var releaseConfirmations atomic.Int32
+	context.apiProvider.(*client.MockedAPIProvider).MockSchedulerAPIUpdateAllocationFn(func(request *si.AllocationRequest) error {
+		if request.Releases != nil {
+			for _, release := range request.Releases.AllocationsToRelease {
+				if release.ApplicationID == appID && release.AllocationKey == taskUID1 {
+					releaseConfirmations.Add(1)
+				}
+			}
+		}
+		return nil
+	})
+
+	var deleteAttempts atomic.Int32
+	firstDeleteFailed := make(chan struct{})
+	retryStarted := make(chan struct{})
+	retryFinished := make(chan struct{})
+	allowRetryToFinish := make(chan struct{})
+	var closeRetryGate sync.Once
+	defer closeRetryGate.Do(func() { close(allowRetryToFinish) })
+	deleteUIDs := make(chan string, 2)
+	context.apiProvider.(*client.MockedAPIProvider).MockDeleteFn(func(pod *v1.Pod) error { //nolint:errcheck
+		deleteUIDs <- string(pod.UID)
+		switch deleteAttempts.Add(1) {
+		case 1:
+			close(firstDeleteFailed)
+			return errors.New("transient pod delete failure")
+		case 2:
+			close(retryStarted)
+			<-allowRetryToFinish
+			close(retryFinished)
+		}
+		return nil
+	})
+
+	err = callback.UpdateAllocation(&si.AllocationResponse{
+		Released: []*si.AllocationRelease{
+			{
+				ApplicationID:   appID,
+				AllocationKey:   taskUID1,
+				TerminationType: si.TerminationType_PREEMPTED_BY_SCHEDULER,
+			},
+		},
+	})
+	assert.NilError(t, err, "error updating allocation")
+	select {
+	case <-firstDeleteFailed:
+	case <-time.After(time.Second):
+		t.Fatal("first DELETE did not execute and return the injected transient failure")
+	}
+	assert.Equal(t, si.TerminationType_PREEMPTED_BY_SCHEDULER.String(), task.GetTaskTerminationType(),
+		"release event was not consumed by the application")
+	assert.Equal(t, taskUID1, <-deleteUIDs, "first DELETE was not bound to the released pod UID")
+	assert.Equal(t, int32(0), releaseConfirmations.Load(), "unexpected allocation-release confirmation after failed delete")
+
+	select {
+	case <-retryStarted:
+	case <-time.After(time.Second):
+		t.Fatalf("automatic DELETE re-drive did not start; delete attempts: got %d, want >= 2", deleteAttempts.Load())
+	}
+	assert.Equal(t, taskUID1, <-deleteUIDs, "automatic DELETE re-drive was not bound to the released pod UID")
+	assert.Equal(t, int32(2), deleteAttempts.Load(), "unexpected delete attempt count while re-drive is blocked")
+
+	// The second DELETE is blocked in the mock. Reading through GetTask needs
+	// the application lock, so completing this read proves the original event
+	// handler returned and released its lock before the retry finished.
+	handlerProgress := make(chan struct{})
+	go func() {
+		app.GetTask(taskUID1)
+		close(handlerProgress)
+	}()
+	select {
+	case <-handlerProgress:
+	case <-time.After(time.Second):
+		t.Fatal("application lock remained blocked while asynchronous DELETE re-drive was in progress")
+	}
+
+	oldPod := task.GetTaskPod().DeepCopy()
+	updatedPod := oldPod.DeepCopy()
+	updatedPod.Annotations["test.yunikorn.apache.org/non-terminal-update"] = "observed"
+	context.UpdatePod(oldPod, updatedPod)
+	assert.Equal(t, "observed", task.GetTaskPod().Annotations["test.yunikorn.apache.org/non-terminal-update"],
+		"non-terminal pod update was not observed")
+	assert.Equal(t, int32(2), deleteAttempts.Load(), "non-terminal pod update unexpectedly created another deletion")
+	assert.Equal(t, int32(0), releaseConfirmations.Load(), "non-terminal pod update unexpectedly confirmed the release")
+
+	closeRetryGate.Do(func() { close(allowRetryToFinish) })
+	select {
+	case <-retryFinished:
+	case <-time.After(time.Second):
+		t.Fatal("automatic DELETE re-drive did not finish")
+	}
+	assert.Assert(t, deleteAttempts.Load() >= 2,
+		"expected release obligation to be re-driven after transient delete failure; delete attempts: got %d, want >= 2",
+		deleteAttempts.Load())
 }
 
 func TestUpdateAllocation_AllocationReleased_StoppedByRM(t *testing.T) {
